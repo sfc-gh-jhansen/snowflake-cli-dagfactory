@@ -1,0 +1,38 @@
+my_etl_pipeline:
+  schedule: "USING CRON 0 6 * * * America/Los_Angeles"
+  warehouse: "DEMO_WH"
+  comment: "Daily ETL pipeline"
+  task_auto_retry_attempts: 2
+  suspend_task_after_num_failures: 3
+  user_task_timeout_ms: 3600000
+  allow_overlapping_execution: false
+
+  config:
+    environment: "production"
+    path: "/prod/"
+
+  tasks:
+    extract_data:
+      sql: "INSERT INTO staging SELECT * FROM raw_table"
+      warehouse: "DEMO_WH"
+      user_task_timeout_ms: 600000
+
+    transform_data:
+      sql: "INSERT INTO transformed SELECT * FROM staging"
+      dependencies: [extract_data]
+
+    load_dim_customers:
+      sql: "CALL load_dim_customers()"
+      dependencies: [transform_data]
+
+    load_dim_products:
+      stored_procedure: "my_db.my_schema.load_dim_products"
+      dependencies: [transform_data]
+
+    aggregate_sales:
+      sql: "INSERT INTO sales_agg SELECT * FROM staging_sales"
+      dependencies: [load_dim_customers, load_dim_products]
+
+    cleanup:
+      sql: "DROP TABLE IF EXISTS temp_staging"
+      finalizer: true

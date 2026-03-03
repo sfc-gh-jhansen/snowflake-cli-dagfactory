@@ -1,0 +1,9 @@
+definition_version: 2
+entities:
+  my_pipeline:
+    type: dagfactory
+    config_file: dag_config.yml
+    deployer: sql
+    database: DEMO_DB
+    schema_name: DEV_SCHEMA
+    warehouse: DEMO_WH

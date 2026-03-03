@@ -1,0 +1,18 @@
+test_pipeline:
+  schedule: "60 MINUTES"
+  warehouse: "DEMO_WH"
+  comment: "Integration test pipeline"
+  task_auto_retry_attempts: 1
+  suspend_task_after_num_failures: 3
+  tasks:
+    step_one:
+      sql: "SELECT 1"
+    step_two:
+      sql: "SELECT 2"
+      dependencies: [step_one]
+    step_three:
+      sql: "SELECT 3"
+      dependencies: [step_one]
+    step_four:
+      sql: "SELECT 4"
+      dependencies: [step_two, step_three]
