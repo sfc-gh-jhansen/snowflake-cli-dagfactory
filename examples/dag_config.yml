@@ -1,9 +1,11 @@
-my_etl_pipeline:
-  schedule: "USING CRON 0 6 * * * America/Los_Angeles"
+default:
   warehouse: "DEMO_WH"
-  comment: "Daily ETL pipeline"
   task_auto_retry_attempts: 2
   suspend_task_after_num_failures: 3
+
+my_etl_pipeline:
+  schedule: "USING CRON 0 6 * * * America/Los_Angeles"
+  description: "Daily ETL pipeline"
   user_task_timeout_ms: 3600000
   allow_overlapping_execution: false
 
@@ -12,27 +14,40 @@ my_etl_pipeline:
     path: "/prod/"
 
   tasks:
-    extract_data:
+    - task_id: extract_data
       sql: "INSERT INTO staging SELECT * FROM raw_table"
-      warehouse: "DEMO_WH"
+      warehouse: "EXTRACT_WH"
       user_task_timeout_ms: 600000
+      description: "Extract raw data into staging"
 
-    transform_data:
+    - task_id: transform_data
       sql: "INSERT INTO transformed SELECT * FROM staging"
       dependencies: [extract_data]
+      description: "Transform staged data"
 
-    load_dim_customers:
+    - task_id: load_dim_customers
       sql: "CALL load_dim_customers()"
       dependencies: [transform_data]
 
-    load_dim_products:
+    - task_id: load_dim_products
       stored_procedure: "my_db.my_schema.load_dim_products"
       dependencies: [transform_data]
+      task_auto_retry_attempts: 3
 
-    aggregate_sales:
+    - task_id: aggregate_sales
       sql: "INSERT INTO sales_agg SELECT * FROM staging_sales"
       dependencies: [load_dim_customers, load_dim_products]
 
-    cleanup:
+    - task_id: run_forecast
+      notebook_project: "my_db.my_schema.forecast_project"
+      main_file: "forecast.ipynb"
+      compute_pool: "ML_POOL"
+      query_warehouse: "ML_WH"
+      runtime: "2.2-CPU-PY3.11"
+      arguments: "env prod"
+      dependencies: [aggregate_sales]
+      description: "Run sales forecast notebook"
+
+    - task_id: cleanup
       sql: "DROP TABLE IF EXISTS temp_staging"
       finalizer: true

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Protocol
 from snowflake.cli.api.sql_execution import SqlExecutionMixin
 
 from snowflake_cli_dagfactory.config import (
+    BaseTaskConfig,
     DAGConfig,
     DagFactoryConfig,
     TaskConfig,
@@ -102,42 +103,44 @@ class SqlTaskDeployer(SqlExecutionMixin):
             pass
 
         if synthetic_root:
-            self._create_root_task(
+            self._create_task(
                 database=database,
                 schema=schema,
                 task_name=synthetic_root,
                 warehouse=warehouse,
-                dag_config=dag_config,
                 definition="SELECT 1",
                 replace=replace,
+                schedule=dag_config.schedule,
+                dag_config=dag_config,
             )
 
             for candidate in root_candidates:
                 task_cfg = dag_config.tasks[candidate]
                 task_warehouse = task_cfg.warehouse or warehouse
                 definition = task_cfg.resolve_definition()
-                self._create_child_task(
+                self._create_task(
                     database=database,
                     schema=schema,
                     task_name=candidate,
                     warehouse=task_warehouse,
                     definition=definition,
+                    replace=replace,
                     predecessors=[synthetic_root],
                     task_config=task_cfg,
-                    replace=replace,
                 )
         else:
             root_cfg = dag_config.tasks[root_candidates[0]]
             root_warehouse = root_cfg.warehouse or warehouse
             definition = root_cfg.resolve_definition()
-            self._create_root_task(
+            self._create_task(
                 database=database,
                 schema=schema,
                 task_name=root_candidates[0],
                 warehouse=root_warehouse,
-                dag_config=dag_config,
                 definition=definition,
                 replace=replace,
+                schedule=dag_config.schedule,
+                dag_config=dag_config,
             )
 
         for task_name in non_finalizer_tasks:
@@ -147,15 +150,15 @@ class SqlTaskDeployer(SqlExecutionMixin):
             task_warehouse = task_cfg.warehouse or warehouse
             definition = task_cfg.resolve_definition()
             predecessors = task_cfg.dependencies
-            self._create_child_task(
+            self._create_task(
                 database=database,
                 schema=schema,
                 task_name=task_name,
                 warehouse=task_warehouse,
                 definition=definition,
+                replace=replace,
                 predecessors=predecessors,
                 task_config=task_cfg,
-                replace=replace,
             )
 
         finalizer_task_name = None
@@ -163,14 +166,14 @@ class SqlTaskDeployer(SqlExecutionMixin):
             task_cfg = dag_config.tasks[task_name]
             task_warehouse = task_cfg.warehouse or warehouse
             definition = task_cfg.resolve_definition()
-            self._create_finalizer_task(
+            self._create_task(
                 database=database,
                 schema=schema,
                 task_name=task_name,
                 warehouse=task_warehouse,
                 definition=definition,
-                root_task_name=root_task_name,
                 replace=replace,
+                finalize_root=root_task_name,
             )
             finalizer_task_name = task_name
 
@@ -208,108 +211,89 @@ class SqlTaskDeployer(SqlExecutionMixin):
     def _fqn(self, database: str, schema: str, name: str) -> str:
         return f"{database}.{schema}.{name}"
 
-    def _create_root_task(
-        self,
-        database: str,
-        schema: str,
-        task_name: str,
-        warehouse: str,
-        dag_config: DAGConfig,
-        definition: str,
-        replace: bool,
-    ) -> None:
-        fqn = self._fqn(database, schema, task_name)
-        create_keyword = "CREATE OR REPLACE" if replace else "CREATE"
-        parts = [f"{create_keyword} TASK {fqn}"]
-        parts.append(f"  WAREHOUSE = '{warehouse}'")
-
-        if dag_config.schedule:
-            parts.append(f"  SCHEDULE = '{dag_config.schedule}'")
-
-        if dag_config.user_task_timeout_ms is not None:
-            parts.append(f"  USER_TASK_TIMEOUT_MS = {dag_config.user_task_timeout_ms}")
-
-        if dag_config.task_auto_retry_attempts is not None:
-            parts.append(f"  TASK_AUTO_RETRY_ATTEMPTS = {dag_config.task_auto_retry_attempts}")
-
-        if dag_config.suspend_task_after_num_failures is not None:
-            parts.append(f"  SUSPEND_TASK_AFTER_NUM_FAILURES = {dag_config.suspend_task_after_num_failures}")
-
-        if dag_config.allow_overlapping_execution:
-            parts.append("  ALLOW_OVERLAPPING_EXECUTION = TRUE")
-
-        if dag_config.config:
-            config_json = json.dumps(dag_config.config)
-            parts.append(f"  CONFIG = '{config_json}'")
-
-        if dag_config.comment:
-            escaped_comment = dag_config.comment.replace("'", "''")
-            parts.append(f"  COMMENT = '{escaped_comment}'")
-
-        if dag_config.when:
-            parts.append(f"  WHEN\n    {dag_config.when}")
-
-        parts.append(f"  AS\n    {definition}")
-
-        sql = "\n".join(parts)
-        log.info("Creating root task: %s", task_name)
-        log.debug("SQL: %s", sql)
-        self.execute_query(sql)
-
-    def _create_child_task(
+    def _create_task(
         self,
         database: str,
         schema: str,
         task_name: str,
         warehouse: str,
         definition: str,
-        predecessors: List[str],
-        task_config: TaskConfig,
         replace: bool,
+        schedule: Optional[str] = None,
+        predecessors: Optional[List[str]] = None,
+        finalize_root: Optional[str] = None,
+        dag_config: Optional[DAGConfig] = None,
+        task_config: Optional[BaseTaskConfig] = None,
     ) -> None:
+        """Build and execute a CREATE TASK statement.
+
+        Supports three task variants via optional parameters:
+          - Root task: pass schedule + dag_config
+          - Child task: pass predecessors + task_config
+          - Finalizer task: pass finalize_root
+        """
         fqn = self._fqn(database, schema, task_name)
         create_keyword = "CREATE OR REPLACE" if replace else "CREATE"
         parts = [f"{create_keyword} TASK {fqn}"]
         parts.append(f"  WAREHOUSE = '{warehouse}'")
 
-        after_clause = ", ".join(
-            self._fqn(database, schema, dep) for dep in predecessors
+        if schedule:
+            parts.append(f"  SCHEDULE = '{schedule}'")
+
+        if predecessors:
+            after_clause = ", ".join(
+                self._fqn(database, schema, dep) for dep in predecessors
+            )
+            parts.append(f"  AFTER {after_clause}")
+
+        if finalize_root:
+            root_fqn = self._fqn(database, schema, finalize_root)
+            parts.append(f"  FINALIZE = {root_fqn}")
+
+        timeout = (
+            (dag_config.user_task_timeout_ms if dag_config else None)
+            or (task_config.user_task_timeout_ms if task_config else None)
         )
-        parts.append(f"  AFTER {after_clause}")
+        if timeout is not None:
+            parts.append(f"  USER_TASK_TIMEOUT_MS = {timeout}")
 
-        if task_config.user_task_timeout_ms is not None:
-            parts.append(f"  USER_TASK_TIMEOUT_MS = {task_config.user_task_timeout_ms}")
+        retry = (
+            (dag_config.task_auto_retry_attempts if dag_config else None)
+            or (task_config.task_auto_retry_attempts if task_config else None)
+        )
+        if retry is not None:
+            parts.append(f"  TASK_AUTO_RETRY_ATTEMPTS = {retry}")
 
-        if task_config.condition:
-            parts.append(f"  WHEN\n    {task_config.condition}")
+        if dag_config:
+            if dag_config.suspend_task_after_num_failures is not None:
+                parts.append(f"  SUSPEND_TASK_AFTER_NUM_FAILURES = {dag_config.suspend_task_after_num_failures}")
+
+            if dag_config.allow_overlapping_execution:
+                parts.append("  ALLOW_OVERLAPPING_EXECUTION = TRUE")
+
+            if dag_config.config:
+                config_json = json.dumps(dag_config.config)
+                parts.append(f"  CONFIG = '{config_json}'")
+
+        comment = (
+            (dag_config.description if dag_config else None)
+            or (task_config.description if task_config else None)
+        )
+        if comment:
+            escaped = comment.replace("'", "''")
+            parts.append(f"  COMMENT = '{escaped}'")
+
+        condition = (
+            (dag_config.when if dag_config else None)
+            or (task_config.condition if task_config else None)
+        )
+        if condition:
+            parts.append(f"  WHEN\n    {condition}")
 
         parts.append(f"  AS\n    {definition}")
 
         sql = "\n".join(parts)
-        log.info("Creating child task: %s", task_name)
-        log.debug("SQL: %s", sql)
-        self.execute_query(sql)
-
-    def _create_finalizer_task(
-        self,
-        database: str,
-        schema: str,
-        task_name: str,
-        warehouse: str,
-        definition: str,
-        root_task_name: str,
-        replace: bool,
-    ) -> None:
-        fqn = self._fqn(database, schema, task_name)
-        root_fqn = self._fqn(database, schema, root_task_name)
-        create_keyword = "CREATE OR REPLACE" if replace else "CREATE"
-        parts = [f"{create_keyword} TASK {fqn}"]
-        parts.append(f"  WAREHOUSE = '{warehouse}'")
-        parts.append(f"  FINALIZE = {root_fqn}")
-        parts.append(f"  AS\n    {definition}")
-
-        sql = "\n".join(parts)
-        log.info("Creating finalizer task: %s", task_name)
+        log.info("Creating task: %s", task_name)
         log.debug("SQL: %s", sql)
         self.execute_query(sql)
 
